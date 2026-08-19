@@ -1,0 +1,13 @@
+{
+    "display_name": "Multi Theme Importer",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "dependencies": [],
+    "js": "index.js",
+    "author": "Claude",
+    "version": "1.0.0",
+    "homePage": "",
+    "auto_update": false,
+    "description": "UI Theme 패널에서 여러 개의 테마 .json 파일을 한 번에 선택해서 임포트합니다."
+}
