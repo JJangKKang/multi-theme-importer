@@ -6,7 +6,7 @@
     "dependencies": [],
     "js": "index.js",
     "author": "Claude",
-    "version": "1.0.0",
+    "version": "1.1.1",
     "homePage": "",
     "auto_update": false,
     "description": "UI Theme 패널에서 여러 개의 테마 .json 파일을 한 번에 선택해서 임포트합니다."

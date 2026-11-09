@@ -15,12 +15,109 @@
 // 아니라 이 확장의 임포트 목록 화면에서 제공합니다. 대신 저장 전에 미리보기 +
 // 이름 변경까지 끝낼 수 있어서, 저장 후 알파벳순 목록에서 새 테마를 찾아
 // 헤맬 일 자체가 줄어듭니다.
+//
+// v1.1.0 - 새로고침 없이 테마 목록에 바로 나타나게 변경
+// 코어의 테마 배열(power-user.js의 `let themes`)은 export되지 않아서 확장이
+// 직접 건드릴 수 없습니다. /api/themes/save로 직접 저장하면 서버에는 저장되지만
+// 화면의 드롭다운/배열은 새로고침 전까지 갱신되지 않았던 이유가 이것입니다.
+// 그래서 이제는 코어의 기본 "테마 임포트" 입력창(#ui_preset_import_file)에
+// 이름을 바꾼 테마 파일을 하나씩 넣어서, 코어의 importTheme()이 직접
+// 서버 저장 + 배열 추가 + 드롭다운 추가를 하도록 맡깁니다.
+// (코어 입력창을 못 찾는 버전에서는 예전 방식으로 자동 전환됩니다.)
 
 const MODULE_NAME = 'multi_theme_importer';
 const BUTTON_ID = 'multi_theme_import_button';
 const FILE_INPUT_ID = 'multi_theme_import_file';
 const CUSTOM_STYLE_ID = 'custom-style';
 const FLOATING_PANEL_ID = 'multi_theme_import_panel';
+const CORE_IMPORT_INPUT_ID = 'ui_preset_import_file';
+const CORE_THEME_SELECT_ID = 'themes';
+const CORE_IMPORT_TIMEOUT_MS = 20000;
+// @import가 들어간 테마는 코어가 확인 팝업을 띄우므로 사용자가 누를 때까지 넉넉히 기다린다.
+const CORE_IMPORT_CONFIRM_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** 코어 테마 드롭다운에 현재 들어있는 테마 이름 목록 */
+function getCoreThemeNames() {
+    const select = document.getElementById(CORE_THEME_SELECT_ID);
+    if (!select) return new Set();
+    return new Set(Array.from(select.options).map(option => option.value));
+}
+
+/** predicate가 true가 되거나 timeout이 지날 때까지 기다린다. */
+function waitFor(predicate, timeoutMs, intervalMs = 150) {
+    return new Promise(resolve => {
+        const start = Date.now();
+        const tick = () => {
+            if (predicate()) return resolve(true);
+            if (Date.now() - start >= timeoutMs) return resolve(false);
+            setTimeout(tick, intervalMs);
+        };
+        tick();
+    });
+}
+
+/**
+ * 코어의 기본 테마 임포트 입력창에 파일을 넣어서 코어가 직접 임포트하게 한다.
+ * 코어가 서버 저장 + 테마 배열 + 드롭다운을 모두 갱신하므로 새로고침이 필요 없다.
+ * 드롭다운에 해당 이름이 나타나면 성공으로 본다.
+ * @param {object} themeObject 이름까지 확정된 테마 객체
+ * @returns {Promise<boolean>}
+ */
+async function importThroughCore(themeObject) {
+    const input = document.getElementById(CORE_IMPORT_INPUT_ID);
+    // @import가 있는 테마는 코어가 확인 팝업을 띄우므로, 그 팝업만 자동으로 "확인"을 누른다.
+    const stopAutoConfirm = hasCustomCssImport(themeObject) ? startImportPopupAutoConfirm() : () => {};
+    const file = new File(
+        [JSON.stringify(themeObject, null, 4)],
+        `${themeObject.name}.json`,
+        { type: 'application/json' },
+    );
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(file);
+    input.files = dataTransfer.files;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+
+    // 자동 확인이 실패하면 팝업이 그대로 보이므로, 직접 누를 수 있게 넉넉히 기다린다.
+    const timeout = hasCustomCssImport(themeObject) ? CORE_IMPORT_CONFIRM_TIMEOUT_MS : CORE_IMPORT_TIMEOUT_MS;
+    try {
+        return await waitFor(() => getCoreThemeNames().has(themeObject.name), timeout);
+    } finally {
+        stopAutoConfirm();
+    }
+}
+
+/**
+ * 코어의 "@import 포함" 확인 팝업이 뜨면 바로 확인 버튼을 눌러준다.
+ * 내용에 '@import'가 들어있는 팝업만 누르고, 다른 팝업은 건드리지 않는다.
+ * 테마 하나를 임포트하는 동안에만 켜져 있다.
+ * @returns {() => void} 감시를 멈추는 함수
+ */
+function startImportPopupAutoConfirm() {
+    const tryConfirm = () => {
+        for (const dialog of document.querySelectorAll('dialog.popup')) {
+            if (dialog.dataset.mtiAutoConfirmed) continue;
+            if (!(dialog.textContent || '').includes('@import')) continue;
+            const okButton = dialog.querySelector('.popup-button-ok');
+            if (!okButton) continue;
+            dialog.dataset.mtiAutoConfirmed = '1';
+            okButton.click();
+        }
+    };
+    const observer = new MutationObserver(tryConfirm);
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['open'] });
+    tryConfirm();
+    return () => observer.disconnect();
+}
+
+/** 예전 방식: 서버에만 저장 (드롭다운 반영은 새로고침 후) */
+async function saveDirectly(themeObject, headers) {
+    const response = await fetch('/api/themes/save', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(themeObject),
+    });
+    if (!response.ok) throw new Error(`서버 오류 (${response.status})`);
+}
 
 // 테마 미리보기에 사용하는 CSS 변수 목록 (SillyTavern 코어 applyThemeColor와 동일)
 const THEME_CSS_VARS = [
@@ -375,7 +472,7 @@ async function openImportPanel(fileArray) {
             if (hasCustomCssImport(row.parsed)) {
                 const warn = document.createElement('span');
                 warn.textContent = '⚠ @import 포함';
-                warn.title = '이 테마의 커스텀 CSS에는 외부 리소스를 불러오는 @import 구문이 포함되어 있습니다.';
+                warn.title = '이 테마의 커스텀 CSS에는 외부 리소스를 불러오는 @import 구문이 포함되어 있습니다. 저장 시 코어의 확인 팝업은 자동으로 승인됩니다.';
                 warn.style.color = 'orange';
                 warn.style.fontSize = '0.85em';
                 rowEl.appendChild(warn);
@@ -412,7 +509,11 @@ async function openImportPanel(fileArray) {
         renderRows();
     });
 
+    let saving = false;
+
     saveAllBtn.addEventListener('click', async () => {
+        if (saving) return; // 저장 중 중복 클릭 방지
+
         const headers = getRequestHeaders();
         const targets = rows.filter(r => r.parsed && r.include && !r.saved);
 
@@ -421,11 +522,27 @@ async function openImportPanel(fileArray) {
             return;
         }
 
-        statusEl.textContent = '저장 중...';
+        // 코어 임포트 입력창이 있으면 새로고침 없는 방식, 없으면 예전 방식
+        const useCore = !!document.getElementById(CORE_IMPORT_INPUT_ID)
+            && !!document.getElementById(CORE_THEME_SELECT_ID);
+
+        // 코어 importTheme()은 임포트한 테마를 "현재 테마" 설정으로 바꿔버리므로
+        // (다음 새로고침 때 마지막 임포트 테마가 적용됨) 원래 값을 기억했다가 되돌린다.
+        const powerUser = context.powerUserSettings;
+        const prevThemeSetting = powerUser ? powerUser.theme : undefined;
+        const themeSelect = document.getElementById(CORE_THEME_SELECT_ID);
+        const prevSelectValue = themeSelect ? themeSelect.value : null;
+
+        saving = true;
+        saveAllBtn.style.opacity = '0.5';
         let successCount = 0;
         let errorCount = 0;
+        let pendingCount = 0;
 
-        for (const row of targets) {
+        for (const [index, row] of targets.entries()) {
+            statusEl.textContent = `저장 중... (${index + 1}/${targets.length})`;
+            row.saveError = null;
+
             const name = (row.draftName || '').trim();
             if (!name) {
                 row.saveError = '이름 없음';
@@ -433,39 +550,63 @@ async function openImportPanel(fileArray) {
                 continue;
             }
 
+            const payload = { ...row.parsed, name };
+
             try {
-                const payload = { ...row.parsed, name };
-                const response = await fetch('/api/themes/save', {
-                    method: 'POST',
-                    headers,
-                    body: JSON.stringify(payload),
-                });
-
-                if (!response.ok) {
-                    row.saveError = `서버 오류 (${response.status})`;
-                    errorCount++;
-                    continue;
+                if (useCore) {
+                    // 코어 importTheme()은 같은 이름이 있으면 거부하므로 미리 알려준다.
+                    if (getCoreThemeNames().has(name)) {
+                        row.saveError = '같은 이름의 테마가 이미 있음 (이름을 바꿔주세요)';
+                        errorCount++;
+                        continue;
+                    }
+                    const ok = await importThroughCore(payload);
+                    if (ok) {
+                        row.saved = true;
+                        successCount++;
+                    } else {
+                        // 팝업에서 취소했거나 응답이 늦은 경우
+                        row.saveError = '확인 안 됨 (취소했거나 응답 지연)';
+                        pendingCount++;
+                    }
+                } else {
+                    await saveDirectly(payload, headers);
+                    row.saved = true;
+                    successCount++;
                 }
-
-                row.saved = true;
-                successCount++;
             } catch (error) {
-                row.saveError = String(error);
+                row.saveError = String(error.message || error);
                 errorCount++;
             }
+
+            renderRows();
         }
 
+        // 현재 테마 설정/드롭다운 선택을 임포트 전 상태로 되돌린다.
+        if (useCore) {
+            if (powerUser && prevThemeSetting !== undefined && powerUser.theme !== prevThemeSetting) {
+                powerUser.theme = prevThemeSetting;
+                context.saveSettingsDebounced?.();
+            }
+            const select = document.getElementById(CORE_THEME_SELECT_ID);
+            if (select && prevSelectValue !== null) select.value = prevSelectValue;
+        }
+
+        saving = false;
+        saveAllBtn.style.opacity = '';
         renderRows();
 
-        statusEl.textContent = `성공 ${successCount}개 · 실패 ${errorCount}개`;
+        statusEl.textContent = `성공 ${successCount}개 · 실패 ${errorCount + pendingCount}개`;
         if (successCount > 0) {
             toastr.success(
-                `${successCount}개 저장 완료. 다음에 새로고침하면 테마 목록에 나타납니다.`,
+                useCore
+                    ? `${successCount}개 저장 완료. 테마 목록에 바로 추가되었습니다.`
+                    : `${successCount}개 저장 완료. 다음에 새로고침하면 테마 목록에 나타납니다.`,
                 '다중 테마 임포트',
             );
         }
-        if (errorCount > 0) {
-            toastr.error(`${errorCount}개 저장 실패`, '다중 테마 임포트');
+        if (errorCount + pendingCount > 0) {
+            toastr.error(`${errorCount + pendingCount}개 저장 실패 또는 미확인`, '다중 테마 임포트');
         }
     });
 
