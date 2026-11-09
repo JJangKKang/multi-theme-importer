@@ -43,30 +43,54 @@ function getCoreThemeNames() {
     return new Set(Array.from(select.options).map(option => option.value));
 }
 
-/** predicate가 true가 되거나 timeout이 지날 때까지 기다린다. */
-function waitFor(predicate, timeoutMs, intervalMs = 150) {
+/**
+ * 지정한 이름들이 코어 테마 드롭다운에 모두 나타날 때까지 기다린다.
+ * 폴링 대신 드롭다운 변화를 직접 감시하므로 추가되는 즉시 반응한다.
+ * @param {string[]} names
+ * @param {number} timeoutMs
+ * @returns {Promise<Set<string>>} 실제로 나타난 이름들
+ */
+function waitForCoreThemes(names, timeoutMs) {
     return new Promise(resolve => {
-        const start = Date.now();
-        const tick = () => {
-            if (predicate()) return resolve(true);
-            if (Date.now() - start >= timeoutMs) return resolve(false);
-            setTimeout(tick, intervalMs);
+        const select = document.getElementById(CORE_THEME_SELECT_ID);
+        const found = () => {
+            const current = getCoreThemeNames();
+            return new Set(names.filter(name => current.has(name)));
         };
-        tick();
+        let done = false;
+        let observer = null;
+        let timer = null;
+        let backup = null;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            observer?.disconnect();
+            clearTimeout(timer);
+            clearInterval(backup);
+            resolve(found());
+        };
+        const check = () => {
+            if (found().size === names.length) finish();
+        };
+        if (select) {
+            observer = new MutationObserver(check);
+            observer.observe(select, { childList: true });
+        }
+        // 혹시 드롭다운이 통째로 교체되는 경우를 위한 느슨한 예비 확인
+        backup = setInterval(check, 1000);
+        timer = setTimeout(finish, timeoutMs);
+        check();
     });
 }
 
 /**
- * 코어의 기본 테마 임포트 입력창에 파일을 넣어서 코어가 직접 임포트하게 한다.
- * 코어가 서버 저장 + 테마 배열 + 드롭다운을 모두 갱신하므로 새로고침이 필요 없다.
- * 드롭다운에 해당 이름이 나타나면 성공으로 본다.
+ * 코어의 기본 테마 임포트 입력창에 파일 하나를 넣고 change 이벤트를 보낸다.
+ * 코어 핸들러는 이벤트를 받는 즉시 파일을 꺼내가므로, 결과를 기다리지 않고
+ * 바로 다음 파일을 넣어도 된다 (여러 개를 동시에 진행해서 빠르게 끝남).
  * @param {object} themeObject 이름까지 확정된 테마 객체
- * @returns {Promise<boolean>}
  */
-async function importThroughCore(themeObject) {
+function dispatchCoreImport(themeObject) {
     const input = document.getElementById(CORE_IMPORT_INPUT_ID);
-    // @import가 있는 테마는 코어가 확인 팝업을 띄우므로, 그 팝업만 자동으로 "확인"을 누른다.
-    const stopAutoConfirm = hasCustomCssImport(themeObject) ? startImportPopupAutoConfirm() : () => {};
     const file = new File(
         [JSON.stringify(themeObject, null, 4)],
         `${themeObject.name}.json`,
@@ -76,11 +100,35 @@ async function importThroughCore(themeObject) {
     dataTransfer.items.add(file);
     input.files = dataTransfer.files;
     input.dispatchEvent(new Event('change', { bubbles: true }));
+}
 
+/**
+ * 여러 테마를 코어 임포트로 한꺼번에 넣고, 드롭다운에 나타난 이름을 돌려준다.
+ * 동시에 넣었을 때 빠진 것이 있으면 하나씩 다시 시도한다.
+ * @param {object[]} themeObjects
+ * @returns {Promise<Set<string>>}
+ */
+async function importManyThroughCore(themeObjects) {
+    const anyImport = themeObjects.some(hasCustomCssImport);
+    // @import가 있는 테마는 코어가 확인 팝업을 띄우므로, 그 팝업만 자동으로 "확인"을 누른다.
+    const stopAutoConfirm = anyImport ? startImportPopupAutoConfirm() : () => {};
     // 자동 확인이 실패하면 팝업이 그대로 보이므로, 직접 누를 수 있게 넉넉히 기다린다.
-    const timeout = hasCustomCssImport(themeObject) ? CORE_IMPORT_CONFIRM_TIMEOUT_MS : CORE_IMPORT_TIMEOUT_MS;
+    const timeout = anyImport ? CORE_IMPORT_CONFIRM_TIMEOUT_MS : CORE_IMPORT_TIMEOUT_MS;
+
     try {
-        return await waitFor(() => getCoreThemeNames().has(themeObject.name), timeout);
+        for (const theme of themeObjects) dispatchCoreImport(theme);
+        const names = themeObjects.map(theme => theme.name);
+        const imported = await waitForCoreThemes(names, timeout);
+
+        // 동시 진행에서 빠진 것만 하나씩 재시도 (안전장치)
+        for (const theme of themeObjects) {
+            if (imported.has(theme.name)) continue;
+            console.warn(`[${MODULE_NAME}] '${theme.name}' 재시도`);
+            dispatchCoreImport(theme);
+            const retry = await waitForCoreThemes([theme.name], CORE_IMPORT_TIMEOUT_MS);
+            if (retry.has(theme.name)) imported.add(theme.name);
+        }
+        return imported;
     } finally {
         stopAutoConfirm();
     }
@@ -89,11 +137,13 @@ async function importThroughCore(themeObject) {
 /**
  * 코어의 "@import 포함" 확인 팝업이 뜨면 바로 확인 버튼을 눌러준다.
  * 내용에 '@import'가 들어있는 팝업만 누르고, 다른 팝업은 건드리지 않는다.
- * 테마 하나를 임포트하는 동안에만 켜져 있다.
+ * 테마를 임포트하는 동안에만 켜져 있다.
  * @returns {() => void} 감시를 멈추는 함수
  */
 function startImportPopupAutoConfirm() {
+    let scheduled = false;
     const tryConfirm = () => {
+        scheduled = false;
         for (const dialog of document.querySelectorAll('dialog.popup')) {
             if (dialog.dataset.mtiAutoConfirmed) continue;
             if (!(dialog.textContent || '').includes('@import')) continue;
@@ -103,8 +153,13 @@ function startImportPopupAutoConfirm() {
             okButton.click();
         }
     };
-    const observer = new MutationObserver(tryConfirm);
-    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['open'] });
+    // DOM 변화가 몰려도 한 번만 검사하도록 묶어서 처리한다.
+    const observer = new MutationObserver(() => {
+        if (scheduled) return;
+        scheduled = true;
+        queueMicrotask(tryConfirm);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
     tryConfirm();
     return () => observer.disconnect();
 }
@@ -539,48 +594,64 @@ async function openImportPanel(fileArray) {
         let errorCount = 0;
         let pendingCount = 0;
 
-        for (const [index, row] of targets.entries()) {
-            statusEl.textContent = `저장 중... (${index + 1}/${targets.length})`;
-            row.saveError = null;
+        const startedAt = performance.now();
+        statusEl.textContent = `저장 중... (${targets.length}개)`;
 
+        // 1단계: 이름 확인 (빈 이름, 이미 있는 이름, 이번 목록 안에서 겹치는 이름)
+        const existingNames = useCore ? getCoreThemeNames() : new Set();
+        const batchNames = new Set();
+        const ready = [];
+        for (const row of targets) {
+            row.saveError = null;
             const name = (row.draftName || '').trim();
             if (!name) {
                 row.saveError = '이름 없음';
                 errorCount++;
                 continue;
             }
+            // 코어 importTheme()은 같은 이름이 있으면 거부하므로 미리 알려준다.
+            if (useCore && existingNames.has(name)) {
+                row.saveError = '같은 이름의 테마가 이미 있음 (이름을 바꿔주세요)';
+                errorCount++;
+                continue;
+            }
+            if (batchNames.has(name)) {
+                row.saveError = '목록 안에 같은 이름이 또 있음';
+                errorCount++;
+                continue;
+            }
+            batchNames.add(name);
+            ready.push({ row, payload: { ...row.parsed, name } });
+        }
 
-            const payload = { ...row.parsed, name };
-
-            try {
-                if (useCore) {
-                    // 코어 importTheme()은 같은 이름이 있으면 거부하므로 미리 알려준다.
-                    if (getCoreThemeNames().has(name)) {
-                        row.saveError = '같은 이름의 테마가 이미 있음 (이름을 바꿔주세요)';
-                        errorCount++;
-                        continue;
-                    }
-                    const ok = await importThroughCore(payload);
-                    if (ok) {
-                        row.saved = true;
-                        successCount++;
-                    } else {
-                        // 팝업에서 취소했거나 응답이 늦은 경우
-                        row.saveError = '확인 안 됨 (취소했거나 응답 지연)';
-                        pendingCount++;
-                    }
-                } else {
-                    await saveDirectly(payload, headers);
+        // 2단계: 한꺼번에 저장
+        if (useCore && ready.length > 0) {
+            const imported = await importManyThroughCore(ready.map(item => item.payload));
+            for (const { row, payload } of ready) {
+                if (imported.has(payload.name)) {
                     row.saved = true;
                     successCount++;
+                } else {
+                    // 팝업에서 취소했거나 응답이 늦은 경우
+                    row.saveError = '확인 안 됨 (취소했거나 응답 지연)';
+                    pendingCount++;
                 }
-            } catch (error) {
-                row.saveError = String(error.message || error);
-                errorCount++;
             }
-
-            renderRows();
+        } else if (ready.length > 0) {
+            const results = await Promise.allSettled(ready.map(item => saveDirectly(item.payload, headers)));
+            results.forEach((result, i) => {
+                const { row } = ready[i];
+                if (result.status === 'fulfilled') {
+                    row.saved = true;
+                    successCount++;
+                } else {
+                    row.saveError = String(result.reason?.message || result.reason);
+                    errorCount++;
+                }
+            });
         }
+
+        console.log(`[${MODULE_NAME}] ${targets.length}개 처리, ${Math.round(performance.now() - startedAt)}ms`);
 
         // 현재 테마 설정/드롭다운 선택을 임포트 전 상태로 되돌린다.
         if (useCore) {
